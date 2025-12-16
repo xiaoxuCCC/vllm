@@ -13,7 +13,8 @@ On the client side, run:
         --model <your_model> \
         --dataset-name <dataset_name. Default 'random'> \
         --request-rate <request_rate. Default inf> \
-        --num-prompts <num_prompts. Default 1000>
+        --num-prompts <num_prompts. Default 1000> \
+        --num-processes <num_processes. Default 1>
 """
 import argparse
 import asyncio
@@ -33,6 +34,8 @@ from typing import Any, Literal, Optional
 
 import aiohttp
 import numpy as np
+import multiprocessing
+from multiprocessing import Manager, Queue
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -476,6 +479,10 @@ async def benchmark(
     ramp_up_start_rps: Optional[int] = None,
     ramp_up_end_rps: Optional[int] = None,
     ready_check_timeout_sec: int = 600,
+    process_id: int = -1,
+    tqdm_bar_q: Optional[Queue] = None,
+    bench_start_barrier: Optional[asyncio.Barrier] = None,
+    bench_end_barrier: Optional[asyncio.Barrier] = None,
 ):
     task_type = (TaskType.EMBEDDING if api_url.endswith("/v1/embeddings") else
                  TaskType.GENERATION)
@@ -584,7 +591,10 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    if process_id != -1:
+        pbar = None
+    else:
+        pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
     # This can be used once the minimum Python version is 3.10 or higher,
     # and it will simplify the code in limited_request_func.
@@ -593,15 +603,18 @@ async def benchmark(
     semaphore = (asyncio.Semaphore(max_concurrency)
                  if max_concurrency else None)
 
-    async def limited_request_func(request_func_input, session, pbar):
+    async def limited_request_func(request_func_input, session, pbar, process_id, tqdm_bar_q):
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input,
+            res = await request_func(request_func_input=request_func_input,
                                       session=session,
                                       pbar=pbar)
         async with semaphore:
-            return await request_func(request_func_input=request_func_input,
+            res = await request_func(request_func_input=request_func_input,
                                       session=session,
                                       pbar=pbar)
+        if process_id != -1:
+            tqdm_bar_q.put((process_id, 1))
+        return res
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
@@ -615,6 +628,8 @@ async def benchmark(
             "timestamp": datetime.now().isoformat(),
         })
 
+    if process_id != -1:
+        bench_start_barrier.wait()
     async for request, current_request_rate in get_request(
             input_requests, request_rate, burstiness, ramp_up_strategy,
             ramp_up_start_rps, ramp_up_end_rps):
@@ -658,10 +673,14 @@ async def benchmark(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
                                      session=session,
-                                     pbar=pbar)))
+                                     pbar=pbar,
+                                     process_id=process_id,
+                                     tqdm_bar_q=tqdm_bar_q)))
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
-    if pbar is not None:
+    if process_id != -1:
+        tqdm_bar_q.put((process_id, None))
+    elif pbar is not None:
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -732,7 +751,27 @@ async def benchmark(
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            "mean_ttft_ms": metrics.mean_ttft_ms,
+            "median_ttft_ms": metrics.median_ttft_ms,
+            "std_ttft_ms": metrics.std_ttft_ms,
+            "mean_tpot_ms": metrics.mean_tpot_ms,
+            "median_tpot_ms": metrics.median_tpot_ms,
+            "std_tpot_ms": metrics.std_tpot_ms,
+            "mean_itl_ms": metrics.mean_itl_ms,
+            "median_itl_ms": metrics.median_itl_ms,
+            "std_itl_ms": metrics.std_itl_ms,
+            "mean_e2el_ms": metrics.mean_e2el_ms,
+            "median_e2el_ms": metrics.median_e2el_ms,
+            "std_e2el_ms": metrics.std_e2el_ms,
         }
+        for p, val in metrics.percentiles_ttft_ms:
+            result[f"p{p}_ttft_ms"] = val
+        for p, val in metrics.percentiles_tpot_ms:
+            result[f"p{p}_tpot_ms"] = val
+        for p, val in metrics.percentiles_itl_ms:
+            result[f"p{p}_itl_ms"] = val
+        for p, val in metrics.percentiles_e2el_ms:
+            result[f"p{p}_e2el_ms"] = val
     else:
         result = {
             "duration": benchmark_duration,
@@ -742,7 +781,12 @@ async def benchmark(
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
+            "mean_e2el_ms": metrics.mean_e2el_ms,
+            "median_e2el_ms": metrics.median_e2el_ms,
+            "std_e2el_ms": metrics.std_e2el_ms,
         }
+        for p, val in metrics.percentiles_e2el_ms:
+            result[f"p{p}_e2el_ms"] = val
 
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
@@ -805,6 +849,126 @@ async def benchmark(
 
     await session.close()
     return result
+
+
+def worker_process(
+    args: argparse.Namespace,
+    tokenizer_id: str,
+    tokenizer_mode: str,
+    api_url: str,
+    base_url: str,
+    headers,
+    goodput_config_dict,
+    sampling_params,
+    sub_requests,
+    sub_max_concurrency,
+    sub_request_rate,
+    sub_ramp_up_start_rps,
+    sub_ramp_up_end_rps,
+    return_dict,
+    process_id,
+    bench_start_barrier,
+    bench_end_barrier,
+    tqdm_bar_q
+):
+    # try:
+        # Every process should has it's own tokenizer
+    tokenizer = get_tokenizer(
+        tokenizer_id,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=args.trust_remote_code
+    )
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    sub_result = loop.run_until_complete(
+        benchmark(
+            endpoint_type=args.backend,
+            api_url=api_url,
+            base_url=base_url,
+            model_id=args.model,
+            model_name=args.served_model_name,
+            tokenizer=tokenizer,
+            input_requests=sub_requests,
+            logprobs=args.logprobs,
+            request_rate=sub_request_rate,
+            burstiness=args.burstiness,
+            disable_tqdm=args.disable_tqdm,
+            profile=args.profile,
+            selected_percentile_metrics=args.percentile_metrics.split(","),
+            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
+            ignore_eos=args.ignore_eos,
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=sub_max_concurrency,
+            lora_modules=args.lora_modules,
+            extra_headers=headers,
+            extra_body=sampling_params,
+            ramp_up_strategy=args.ramp_up_strategy,
+            ramp_up_start_rps=sub_ramp_up_start_rps,
+            ramp_up_end_rps=sub_ramp_up_end_rps,
+            ready_check_timeout_sec=args.ready_check_timeout_sec,
+            process_id=process_id,
+            tqdm_bar_q=tqdm_bar_q,
+            bench_start_barrier=bench_start_barrier,
+            bench_end_barrier=bench_end_barrier
+        )
+    )
+    return_dict[process_id] = sub_result
+    # except Exception as e:
+    #     print(f"子进程 {process_id} 执行失败: {str(e)}")
+    #     return_dict[process_id] = None
+
+
+def merge_subprocess_results(return_dict, num_processes):
+    """汇总所有子进程结果为全局指标"""
+    valid_results = [v for k, v in return_dict.items() if v is not None]
+    if not valid_results:
+        raise ValueError("所有子进程执行失败，请检查日志")
+
+    # 初始化合并结果
+    merged = {
+        "duration": max(r["duration"] for r in valid_results),
+        "completed": sum(r["completed"] for r in valid_results),
+        "total_input_tokens": sum(r["total_input_tokens"] for r in valid_results),
+        "total_output_tokens": sum(r.get("total_output_tokens", 0) for r in valid_results),
+        "request_throughput": sum(r["request_throughput"] for r in valid_results),
+        "output_throughput": sum(r.get("output_throughput", 0) for r in valid_results),
+        "total_token_throughput": sum(r["total_token_throughput"] for r in valid_results),
+        "max_output_tokens_per_s": max(r.get("max_output_tokens_per_s", 0) for r in valid_results),
+        "max_concurrent_requests": max(r.get("max_concurrent_requests", 0) for r in valid_results),
+        # "request_goodput": sum(r.get("request_goodput", 0) for r in valid_results),
+    }
+
+    # 合并延迟指标（所有子进程的延迟列表合并后重新计算）
+    all_ttfts = []
+    all_tpots = []
+    all_itls = []
+    all_e2els = []
+    for r in valid_results:
+        all_ttfts.extend(r.get("ttfts", []))
+        all_tpots.extend([t for sublist in r.get("tpots", []) for t in sublist] if isinstance(r.get("tpots"), list) else r.get("tpots", []))
+        all_itls.extend([t for sublist in r.get("itls", []) for t in sublist] if isinstance(r.get("itls"), list) else r.get("itls", []))
+        all_e2els.extend([t for sublist in r.get("e2els", []) for t in sublist] if isinstance(r.get("e2els"), list) else r.get("e2els", []))
+
+    # 计算合并后的延迟统计
+    merged["mean_ttft_ms"] = np.mean(all_ttfts) * 1000 if all_ttfts else 0.0
+    merged["median_ttft_ms"] = np.median(all_ttfts) * 1000 if all_ttfts else 0.0
+    merged["std_ttft_ms"] = np.std(all_ttfts) * 1000 if all_ttfts else 0.0
+
+    merged["mean_tpot_ms"] = np.mean(all_tpots) * 1000 if all_tpots else 0.0
+    merged["median_tpot_ms"] = np.median(all_tpots) * 1000 if all_tpots else 0.0
+    merged["std_tpot_ms"] = np.std(all_tpots) * 1000 if all_tpots else 0.0
+
+    merged["mean_itl_ms"] = np.mean(all_itls) * 1000 if all_itls else 0.0
+    merged["median_itl_ms"] = np.median(all_itls) * 1000 if all_itls else 0.0
+    merged["std_itl_ms"] = np.std(all_itls) * 1000 if all_itls else 0.0
+
+    merged["mean_e2el_ms"] = np.mean(all_e2els) * 1000 if all_e2els else 0.0
+    merged["median_e2el_ms"] = np.median(all_e2els) * 1000 if all_e2els else 0.0
+    merged["std_e2el_ms"] = np.std(all_e2els) * 1000 if all_e2els else 0.0
+
+    return merged
 
 
 def check_goodput_args(args):
@@ -1158,10 +1322,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "in seconds (default: 600 seconds / 10 minutes). If set to 0, "
         "the ready check will be skipped."
     )
-
-
-def main(args: argparse.Namespace) -> dict[str, Any]:
-    return asyncio.run(main_async(args))
+    parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=1,
+        help="Number of processes to send requests.",
+    )
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
@@ -1246,113 +1412,176 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
 
-    # Avoid GC processing "static" data - reduce pause times.
-    gc.collect()
-    gc.freeze()
+    if args.num_processes == 1:
+        gc.collect()
+        gc.freeze()
+        benchmark_result = await benchmark(
+            endpoint_type=args.backend,
+            api_url=api_url,
+            base_url=base_url,
+            model_id=model_id,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            logprobs=args.logprobs,
+            request_rate=args.request_rate,
+            burstiness=args.burstiness,
+            disable_tqdm=args.disable_tqdm,
+            profile=args.profile,
+            selected_percentile_metrics=args.percentile_metrics.split(","),
+            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
+            ignore_eos=args.ignore_eos,
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=args.max_concurrency,
+            lora_modules=args.lora_modules,
+            extra_headers=None,
+            extra_body=sampling_params,
+            ramp_up_strategy=args.ramp_up_strategy,
+            ramp_up_start_rps=args.ramp_up_start_rps,
+            ramp_up_end_rps=args.ramp_up_end_rps,
+            ready_check_timeout_sec=args.ready_check_timeout_sec,
+        )
+    else:
+        print(f"Starting multi-process benchmark with {args.num_processes} processes.")
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    benchmark_result = await benchmark(
-        endpoint_type=args.backend,
-        api_url=api_url,
-        base_url=base_url,
-        model_id=model_id,
-        model_name=model_name,
-        tokenizer=tokenizer,
-        input_requests=input_requests,
-        logprobs=args.logprobs,
-        request_rate=args.request_rate,
-        burstiness=args.burstiness,
-        disable_tqdm=args.disable_tqdm,
-        profile=args.profile,
-        selected_percentile_metrics=args.percentile_metrics.split(","),
-        selected_percentiles=[
-            float(p) for p in args.metric_percentiles.split(",")
-        ],
-        ignore_eos=args.ignore_eos,
-        goodput_config_dict=goodput_config_dict,
-        max_concurrency=args.max_concurrency,
-        lora_modules=args.lora_modules,
-        extra_headers=headers,
-        extra_body=sampling_params,
-        ramp_up_strategy=args.ramp_up_strategy,
-        ramp_up_start_rps=args.ramp_up_start_rps,
-        ramp_up_end_rps=args.ramp_up_end_rps,
-        ready_check_timeout_sec=args.ready_check_timeout_sec,
-    )
+        # 划分每个 benchmark 进程应该具有的 input_requests, max_concurrency, request_rate, ramp_up_start_rps, ramp_up_end_rps
+        chunk_size = len(input_requests) // args.num_processes
+        sub_input_requests_list = [
+            input_requests[i*chunk_size : (i+1)*chunk_size]
+            for i in range(args.num_processes)
+        ]
+        if len(input_requests) % args.num_processes != 0:
+            sub_input_requests_list[-1].extend(input_requests[args.num_processes * chunk_size:])
 
-    # Save config and results to json
-    result_json: dict[str, Any] = {}
+        if args.max_concurrency is None:
+            sub_max_concurrency_list = [None] * args.num_processes
+        else:
+            chunk_size = args.max_concurrency // args.num_processes
+            sub_max_concurrency_list = [chunk_size] * (args.num_processes - 1)
+            sub_max_concurrency_list.append(args.max_concurrency - chunk_size * (args.num_processes - 1))
 
-    # Setup
+        if args.request_rate == float("inf"):
+            sub_request_rate_list = [float("inf")] * args.num_processes
+        else:
+            # 按照 sub_input_requests_list 中每个进程的请求数量的比例划分每个进程的 request_rate
+            sub_request_rate_list = []
+            for x in sub_input_requests_list:
+                sub_request_rate_list.append(args.request_rate * len(x) / len(input_requests))
+
+        if args.ramp_up_start_rps is None:
+            sub_ramp_up_start_rps_list = [None] * args.num_processes
+        else:
+            chunk_size = args.ramp_up_start_rps // args.num_processes
+            sub_ramp_up_start_rps_list = [chunk_size] * (args.num_processes - 1)
+            sub_ramp_up_start_rps_list.append(args.ramp_up_start_rps - chunk_size * (args.num_processes - 1))
+            sub_ramp_up_start_rps_list = sorted(sub_ramp_up_start_rps_list)
+
+        if args.ramp_up_end_rps is None:
+            sub_ramp_up_end_rps_list = [None] * args.num_processes
+        else:
+            chunk_size = args.ramp_up_end_rps // args.num_processes
+            sub_ramp_up_end_rps_list = [chunk_size] * (args.num_processes - 1)
+            sub_ramp_up_end_rps_list.append(args.ramp_up_end_rps - chunk_size * (args.num_processes - 1))
+            sub_ramp_up_end_rps_list = sorted(sub_ramp_up_end_rps_list)
+
+        manager = Manager()
+        tqdm_bar_q = Queue()
+        bench_start_barrier = manager.Barrier(args.num_processes)
+        bench_end_barrier = manager.Barrier(args.num_processes)
+        return_dict = manager.dict()
+        processes = []
+        progress_bars = []
+
+        for i in range(args.num_processes):
+            bar = tqdm(
+                total=len(sub_input_requests_list[i]),
+                desc=f"benchmark process <{i}>",
+                position=i,
+                leave=True
+            )
+            progress_bars.append(bar)
+
+            p = multiprocessing.Process(
+                target=worker_process,
+                args=(args, tokenizer_id, tokenizer_mode, api_url, base_url, headers, goodput_config_dict, sampling_params, sub_input_requests_list[i], sub_max_concurrency_list[i], sub_request_rate_list[i], sub_ramp_up_start_rps_list[i], sub_ramp_up_end_rps_list[i], return_dict, i, bench_start_barrier, bench_end_barrier, tqdm_bar_q)
+            )
+            processes.append(p)
+            p.start()
+            print(f"Started process {i} (handling {len(sub_input_requests_list[i])} requests)")
+
+        finished_tasks = 0
+        while finished_tasks < args.num_processes:
+            if not tqdm_bar_q.empty():
+                process_id, delta = tqdm_bar_q.get()
+                if delta is None:
+                    finished_tasks += 1
+                    progress_bars[process_id].close()
+                else:
+                    progress_bars[process_id].update(delta)
+
+        for i, p in enumerate(processes):
+            p.join()
+            print(f"Process {i} finished (exit code: {p.exitcode})")
+
+        benchmark_result = merge_subprocess_results(return_dict, args.num_processes)
+        print(f"Multi-process benchmark completed, merged {len(return_dict)} valid process results")
+
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_json["date"] = current_dt
-    result_json["endpoint_type"] = args.backend # for backward compatibility
-    result_json["backend"] = args.backend
-    result_json["label"] = label
-    result_json["model_id"] = model_id
-    result_json["tokenizer_id"] = tokenizer_id
-    result_json["num_prompts"] = args.num_prompts
+    base_model_id = model_id.split("/")[-1]
+    max_concurrency_str = f"-concurrency{args.max_concurrency}" if args.max_concurrency else ""
+    if args.ramp_up_strategy is not None:
+        file_name = f"{label}-ramp-up-{args.ramp_up_strategy}-{args.ramp_up_start_rps}qps-{args.ramp_up_end_rps}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
+    else:
+        req_rate_str = "inf" if args.request_rate == float("inf") else f"{args.request_rate}"
+        file_name = f"{label}-{req_rate_str}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
 
-    # Metadata
+    if args.result_filename:
+        file_name = args.result_filename
+    if args.result_dir:
+        os.makedirs(args.result_dir, exist_ok=True)
+        file_name = os.path.join(args.result_dir, file_name)
+
+    result_json = {
+        "date": current_dt,
+        "backend": args.backend,
+        "label": label,
+        "model_id": model_id,
+        "tokenizer_id": tokenizer_id,
+        "num_prompts": args.num_prompts,
+        "num_processes": args.num_processes,
+        "request_rate": args.request_rate if args.request_rate != float("inf") else "inf",
+        "burstiness": args.burstiness,
+        "max_concurrency": args.max_concurrency,
+        **benchmark_result
+    }
+
     if args.metadata:
         for item in args.metadata:
-            if "=" in item:
-                kvstring = item.split("=", 1)
-                result_json[kvstring[0].strip()] = kvstring[1].strip()
-            else:
-                raise ValueError(
-                    "Invalid metadata format. Please use KEY=VALUE format.")
+            k, v = item.split("=", 1)
+            result_json[k.strip()] = v.strip()
 
-    # Traffic
-    result_json["request_rate"] = (args.request_rate if args.request_rate
-                                   < float("inf") else "inf")
-    result_json["burstiness"] = args.burstiness
-    result_json["max_concurrency"] = args.max_concurrency
-
-    if args.ramp_up_strategy is not None:
-        result_json["ramp_up_strategy"] = args.ramp_up_strategy
-        result_json["ramp_up_start_rps"] = args.ramp_up_start_rps
-        result_json["ramp_up_end_rps"] = args.ramp_up_end_rps
-
-    # Merge with benchmark result
-    result_json = {**result_json, **benchmark_result}
-
-    if not args.save_detailed:
-        # Remove fields with too many data points
-        for field in [
-                "input_lens",
-                "output_lens",
-                "ttfts",
-                "itls",
-                "generated_texts",
-                "errors",
-        ]:
-            if field in result_json:
-                del result_json[field]
-            if field in benchmark_result:
-                del benchmark_result[field]
-
-        # Save to file
     if args.save_result or args.append_result:
-        base_model_id = model_id.split("/")[-1]
-        max_concurrency_str = (f"-concurrency{args.max_concurrency}"
-                               if args.max_concurrency is not None else "")
-        label = label or args.backend
-        if args.ramp_up_strategy is not None:
-            file_name = f"{label}-ramp-up-{args.ramp_up_strategy}-{args.ramp_up_start_rps}qps-{args.ramp_up_end_rps}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
-        else:
-            file_name = f"{label}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
-        if args.result_filename:
-            file_name = args.result_filename
-        if args.result_dir:
-            os.makedirs(args.result_dir, exist_ok=True)
-            file_name = os.path.join(args.result_dir, file_name)
-        with open(file_name,
-                  mode="a+" if args.append_result else "w",
-                  encoding="utf-8") as outfile:
-            # Append a newline.
-            if args.append_result and outfile.tell() != 0:
-                outfile.write("\n")
-            json.dump(result_json, outfile)
+        mode = "a+" if args.append_result else "w"
+        with open(file_name, mode, encoding="utf-8") as f:
+            if args.append_result and f.tell() != 0:
+                f.write("\n")
+            json.dump(result_json, f, indent=2)
+        print(f"Benchmark result saved to: {file_name}")
         save_to_pytorch_benchmark_format(args, result_json, file_name)
 
+    print("\n" + "="*80)
+    print("Final Benchmark Summary (Multi-Process)" if args.num_processes > 1 else "Final Benchmark Summary (Single-Process)")
+    print("="*80)
+    print(f"Total Successful Requests: {benchmark_result['completed']}")
+    print(f"Total Input Tokens: {benchmark_result['total_input_tokens']}")
+    print(f"Total Output Tokens: {benchmark_result.get('total_output_tokens', 0)}")
+    print(f"Request Throughput (req/s): {benchmark_result['request_throughput']:.2f}")
+    print(f"Total Token Throughput (tok/s): {benchmark_result['total_token_throughput']:.2f}")
+    print(f"Mean E2E Latency (ms): {benchmark_result['mean_e2el_ms']:.2f}")
+    print(f"Median TTFT (ms): {benchmark_result['median_ttft_ms']:.2f}")
+    print("="*80)
     return result_json
+
+def main(args: argparse.Namespace) -> dict[str, Any]:
+    return asyncio.run(main_async(args))
