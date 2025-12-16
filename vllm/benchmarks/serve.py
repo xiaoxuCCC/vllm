@@ -454,6 +454,168 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+def process_benchmark_results(
+    outputs: list[RequestFuncOutput],
+    input_requests: list[SampleRequest],
+    task_type: TaskType,
+    tokenizer: PreTrainedTokenizerBase,
+    benchmark_duration: float,
+    request_rate: float,
+    selected_percentiles: list[float],
+    selected_percentile_metrics: list[str],
+    goodput_config_dict: dict[str, float],
+    max_concurrency: Optional[int],
+    rps_change_events: list[dict[str, Any]],
+):
+    if task_type == TaskType.GENERATION:
+        metrics, actual_output_lens = calculate_metrics(
+            input_requests=input_requests,
+            outputs=outputs,
+            dur_s=benchmark_duration,
+            tokenizer=tokenizer,
+            selected_percentiles=selected_percentiles,
+            goodput_config_dict=goodput_config_dict,
+        )
+    else:
+        metrics = calculate_metrics_for_embeddings(
+            outputs=outputs,
+            dur_s=benchmark_duration,
+            selected_percentiles=selected_percentiles,
+        )
+        actual_output_lens = 0
+
+    print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
+    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    if max_concurrency is not None:
+        print("{:<40} {:<10}".format("Maximum request concurrency:",
+                                     max_concurrency))
+    if request_rate != float('inf'):
+        print("{:<40} {:<10.2f}".format("Request rate configured (RPS):",
+                                        request_rate))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
+                                    benchmark_duration))
+    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    if isinstance(metrics, BenchmarkMetrics):
+        print("{:<40} {:<10}".format("Total generated tokens:",
+                                     metrics.total_output))
+    print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
+                                    metrics.request_throughput))
+    if goodput_config_dict:
+        print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
+                                        metrics.request_goodput))
+    if isinstance(metrics, BenchmarkMetrics):
+        print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
+                                        metrics.output_throughput))
+        print("{:<40} {:<10.2f}".format(
+            "Peak output token throughput (tok/s):",
+            metrics.max_output_tokens_per_s))
+        print("{:<40} {:<10.2f}".format("Peak concurrent requests:",
+                                        metrics.max_concurrent_requests))
+    print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
+                                    metrics.total_token_throughput))
+
+    if isinstance(metrics, BenchmarkMetrics):
+        result = {
+            "duration": benchmark_duration,
+            "completed": metrics.completed,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "request_throughput": metrics.request_throughput,
+            "request_goodput":
+            metrics.request_goodput if goodput_config_dict else None,
+            "output_throughput": metrics.output_throughput,
+            "total_token_throughput": metrics.total_token_throughput,
+            "input_lens": [output.prompt_len for output in outputs],
+            "output_lens": actual_output_lens,
+            "ttfts": [output.ttft for output in outputs],
+            "itls": [output.itl for output in outputs],
+            "generated_texts": [output.generated_text for output in outputs],
+            "errors": [output.error for output in outputs],
+            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
+            "max_concurrent_requests": metrics.max_concurrent_requests,
+            "mean_ttft_ms": metrics.mean_ttft_ms,
+            "median_ttft_ms": metrics.median_ttft_ms,
+            "std_ttft_ms": metrics.std_ttft_ms,
+            "mean_tpot_ms": metrics.mean_tpot_ms,
+            "median_tpot_ms": metrics.median_tpot_ms,
+            "std_tpot_ms": metrics.std_tpot_ms,
+            "mean_itl_ms": metrics.mean_itl_ms,
+            "median_itl_ms": metrics.median_itl_ms,
+            "std_itl_ms": metrics.std_itl_ms,
+            "mean_e2el_ms": metrics.mean_e2el_ms,
+            "median_e2el_ms": metrics.median_e2el_ms,
+            "std_e2el_ms": metrics.std_e2el_ms,
+        }
+        for p, val in metrics.percentiles_ttft_ms:
+            result[f"p{p}_ttft_ms"] = val
+        for p, val in metrics.percentiles_tpot_ms:
+            result[f"p{p}_tpot_ms"] = val
+        for p, val in metrics.percentiles_itl_ms:
+            result[f"p{p}_itl_ms"] = val
+        for p, val in metrics.percentiles_e2el_ms:
+            result[f"p{p}_e2el_ms"] = val
+    else:
+        result = {
+            "duration": benchmark_duration,
+            "completed": metrics.completed,
+            "total_input_tokens": metrics.total_input,
+            "request_throughput": metrics.request_throughput,
+            "total_token_throughput": metrics.total_token_throughput,
+            "input_lens": [output.prompt_len for output in outputs],
+            "errors": [output.error for output in outputs],
+            "mean_e2el_ms": metrics.mean_e2el_ms,
+            "median_e2el_ms": metrics.median_e2el_ms,
+            "std_e2el_ms": metrics.std_e2el_ms,
+        }
+        for p, val in metrics.percentiles_e2el_ms:
+            result[f"p{p}_e2el_ms"] = val
+
+    if rps_change_events:
+        result["rps_change_events"] = rps_change_events
+
+    def process_one_metric(
+        # E.g., "ttft"
+        metric_attribute_name: str,
+        # E.g., "TTFT"
+        metric_name: str,
+        # E.g., "Time to First Token"
+        metric_header: str,
+    ):
+        # This function prints and adds statistics of the specified
+        # metric.
+        if metric_attribute_name not in selected_percentile_metrics:
+            return
+        print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
+        print("{:<40} {:<10.2f}".format(
+            f"Mean {metric_name} (ms):",
+            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
+        print("{:<40} {:<10.2f}".format(
+            f"Median {metric_name} (ms):",
+            getattr(metrics, f"median_{metric_attribute_name}_ms")))
+        result[f"mean_{metric_attribute_name}_ms"] = getattr(
+            metrics, f"mean_{metric_attribute_name}_ms")
+        result[f"median_{metric_attribute_name}_ms"] = getattr(
+            metrics, f"median_{metric_attribute_name}_ms")
+        result[f"std_{metric_attribute_name}_ms"] = getattr(
+            metrics, f"std_{metric_attribute_name}_ms")
+        for p, value in getattr(metrics,
+                                f"percentiles_{metric_attribute_name}_ms"):
+            p_word = str(int(p)) if int(p) == p else str(p)
+            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
+                                            value))
+            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+
+    if task_type == TaskType.GENERATION:
+        process_one_metric("ttft", "TTFT", "Time to First Token")
+        process_one_metric("tpot", "TPOT",
+                           "Time per Output Token (excl. 1st token)")
+        process_one_metric("itl", "ITL", "Inter-token Latency")
+    process_one_metric("e2el", "E2EL", "End-to-end Latency")
+
+    print("=" * 50)
+    return result
+
+
 async def benchmark(
     endpoint_type: str,
     api_url: str,
@@ -683,155 +845,6 @@ async def benchmark(
     elif pbar is not None:
         pbar.close()
 
-    benchmark_duration = time.perf_counter() - benchmark_start_time
-
-    if task_type == TaskType.GENERATION:
-        metrics, actual_output_lens = calculate_metrics(
-            input_requests=input_requests,
-            outputs=outputs,
-            dur_s=benchmark_duration,
-            tokenizer=tokenizer,
-            selected_percentiles=selected_percentiles,
-            goodput_config_dict=goodput_config_dict,
-        )
-    else:
-        metrics = calculate_metrics_for_embeddings(
-            outputs=outputs,
-            dur_s=benchmark_duration,
-            selected_percentiles=selected_percentiles,
-        )
-        actual_output_lens = 0
-
-    print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
-    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    if max_concurrency is not None:
-        print("{:<40} {:<10}".format("Maximum request concurrency:",
-                                     max_concurrency))
-    if request_rate != float('inf'):
-        print("{:<40} {:<10.2f}".format("Request rate configured (RPS):",
-                                        request_rate))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
-                                    benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    if isinstance(metrics, BenchmarkMetrics):
-        print("{:<40} {:<10}".format("Total generated tokens:",
-                                     metrics.total_output))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
-                                    metrics.request_throughput))
-    if goodput_config_dict:
-        print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
-                                        metrics.request_goodput))
-    if isinstance(metrics, BenchmarkMetrics):
-        print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                        metrics.output_throughput))
-        print("{:<40} {:<10.2f}".format(
-            "Peak output token throughput (tok/s):",
-            metrics.max_output_tokens_per_s))
-        print("{:<40} {:<10.2f}".format("Peak concurrent requests:",
-                                        metrics.max_concurrent_requests))
-    print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
-                                    metrics.total_token_throughput))
-
-    if isinstance(metrics, BenchmarkMetrics):
-        result = {
-            "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "total_input_tokens": metrics.total_input,
-            "total_output_tokens": metrics.total_output,
-            "request_throughput": metrics.request_throughput,
-            "request_goodput":
-            metrics.request_goodput if goodput_config_dict else None,
-            "output_throughput": metrics.output_throughput,
-            "total_token_throughput": metrics.total_token_throughput,
-            "input_lens": [output.prompt_len for output in outputs],
-            "output_lens": actual_output_lens,
-            "ttfts": [output.ttft for output in outputs],
-            "itls": [output.itl for output in outputs],
-            "generated_texts": [output.generated_text for output in outputs],
-            "errors": [output.error for output in outputs],
-            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
-            "max_concurrent_requests": metrics.max_concurrent_requests,
-            "mean_ttft_ms": metrics.mean_ttft_ms,
-            "median_ttft_ms": metrics.median_ttft_ms,
-            "std_ttft_ms": metrics.std_ttft_ms,
-            "mean_tpot_ms": metrics.mean_tpot_ms,
-            "median_tpot_ms": metrics.median_tpot_ms,
-            "std_tpot_ms": metrics.std_tpot_ms,
-            "mean_itl_ms": metrics.mean_itl_ms,
-            "median_itl_ms": metrics.median_itl_ms,
-            "std_itl_ms": metrics.std_itl_ms,
-            "mean_e2el_ms": metrics.mean_e2el_ms,
-            "median_e2el_ms": metrics.median_e2el_ms,
-            "std_e2el_ms": metrics.std_e2el_ms,
-        }
-        for p, val in metrics.percentiles_ttft_ms:
-            result[f"p{p}_ttft_ms"] = val
-        for p, val in metrics.percentiles_tpot_ms:
-            result[f"p{p}_tpot_ms"] = val
-        for p, val in metrics.percentiles_itl_ms:
-            result[f"p{p}_itl_ms"] = val
-        for p, val in metrics.percentiles_e2el_ms:
-            result[f"p{p}_e2el_ms"] = val
-    else:
-        result = {
-            "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "total_input_tokens": metrics.total_input,
-            "request_throughput": metrics.request_throughput,
-            "total_token_throughput": metrics.total_token_throughput,
-            "input_lens": [output.prompt_len for output in outputs],
-            "errors": [output.error for output in outputs],
-            "mean_e2el_ms": metrics.mean_e2el_ms,
-            "median_e2el_ms": metrics.median_e2el_ms,
-            "std_e2el_ms": metrics.std_e2el_ms,
-        }
-        for p, val in metrics.percentiles_e2el_ms:
-            result[f"p{p}_e2el_ms"] = val
-
-    if rps_change_events:
-        result["rps_change_events"] = rps_change_events
-
-    def process_one_metric(
-        # E.g., "ttft"
-        metric_attribute_name: str,
-        # E.g., "TTFT"
-        metric_name: str,
-        # E.g., "Time to First Token"
-        metric_header: str,
-    ):
-        # This function prints and adds statistics of the specified
-        # metric.
-        if metric_attribute_name not in selected_percentile_metrics:
-            return
-        print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
-        print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
-        print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms")))
-        result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
-        result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
-        result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
-            p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
-            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
-
-    if task_type == TaskType.GENERATION:
-        process_one_metric("ttft", "TTFT", "Time to First Token")
-        process_one_metric("tpot", "TPOT",
-                           "Time per Output Token (excl. 1st token)")
-        process_one_metric("itl", "ITL", "Inter-token Latency")
-    process_one_metric("e2el", "E2EL", "End-to-end Latency")
-
-    print("=" * 50)
-
     if profile:
         print("Stopping profiler...")
         profile_input = RequestFuncInput(
@@ -848,6 +861,25 @@ async def benchmark(
             print("Profiler stopped")
 
     await session.close()
+
+    benchmark_duration = time.perf_counter() - benchmark_start_time
+
+    if process_id != -1:
+        return outputs, rps_change_events, benchmark_duration
+
+    result = process_benchmark_results(
+        outputs=outputs,
+        input_requests=input_requests,
+        task_type=task_type,
+        tokenizer=tokenizer,
+        benchmark_duration=benchmark_duration,
+        request_rate=request_rate,
+        selected_percentiles=selected_percentiles,
+        selected_percentile_metrics=selected_percentile_metrics,
+        goodput_config_dict=goodput_config_dict,
+        max_concurrency=max_concurrency,
+        rps_change_events=rps_change_events,
+    )
     return result
 
 
@@ -918,57 +950,6 @@ def worker_process(
     # except Exception as e:
     #     print(f"子进程 {process_id} 执行失败: {str(e)}")
     #     return_dict[process_id] = None
-
-
-def merge_subprocess_results(return_dict, num_processes):
-    """汇总所有子进程结果为全局指标"""
-    valid_results = [v for k, v in return_dict.items() if v is not None]
-    if not valid_results:
-        raise ValueError("所有子进程执行失败，请检查日志")
-
-    # 初始化合并结果
-    merged = {
-        "duration": max(r["duration"] for r in valid_results),
-        "completed": sum(r["completed"] for r in valid_results),
-        "total_input_tokens": sum(r["total_input_tokens"] for r in valid_results),
-        "total_output_tokens": sum(r.get("total_output_tokens", 0) for r in valid_results),
-        "request_throughput": sum(r["request_throughput"] for r in valid_results),
-        "output_throughput": sum(r.get("output_throughput", 0) for r in valid_results),
-        "total_token_throughput": sum(r["total_token_throughput"] for r in valid_results),
-        "max_output_tokens_per_s": max(r.get("max_output_tokens_per_s", 0) for r in valid_results),
-        "max_concurrent_requests": max(r.get("max_concurrent_requests", 0) for r in valid_results),
-        # "request_goodput": sum(r.get("request_goodput", 0) for r in valid_results),
-    }
-
-    # 合并延迟指标（所有子进程的延迟列表合并后重新计算）
-    all_ttfts = []
-    all_tpots = []
-    all_itls = []
-    all_e2els = []
-    for r in valid_results:
-        all_ttfts.extend(r.get("ttfts", []))
-        all_tpots.extend([t for sublist in r.get("tpots", []) for t in sublist] if isinstance(r.get("tpots"), list) else r.get("tpots", []))
-        all_itls.extend([t for sublist in r.get("itls", []) for t in sublist] if isinstance(r.get("itls"), list) else r.get("itls", []))
-        all_e2els.extend([t for sublist in r.get("e2els", []) for t in sublist] if isinstance(r.get("e2els"), list) else r.get("e2els", []))
-
-    # 计算合并后的延迟统计
-    merged["mean_ttft_ms"] = np.mean(all_ttfts) * 1000 if all_ttfts else 0.0
-    merged["median_ttft_ms"] = np.median(all_ttfts) * 1000 if all_ttfts else 0.0
-    merged["std_ttft_ms"] = np.std(all_ttfts) * 1000 if all_ttfts else 0.0
-
-    merged["mean_tpot_ms"] = np.mean(all_tpots) * 1000 if all_tpots else 0.0
-    merged["median_tpot_ms"] = np.median(all_tpots) * 1000 if all_tpots else 0.0
-    merged["std_tpot_ms"] = np.std(all_tpots) * 1000 if all_tpots else 0.0
-
-    merged["mean_itl_ms"] = np.mean(all_itls) * 1000 if all_itls else 0.0
-    merged["median_itl_ms"] = np.median(all_itls) * 1000 if all_itls else 0.0
-    merged["std_itl_ms"] = np.std(all_itls) * 1000 if all_itls else 0.0
-
-    merged["mean_e2el_ms"] = np.mean(all_e2els) * 1000 if all_e2els else 0.0
-    merged["median_e2el_ms"] = np.median(all_e2els) * 1000 if all_e2els else 0.0
-    merged["std_e2el_ms"] = np.std(all_e2els) * 1000 if all_e2els else 0.0
-
-    return merged
 
 
 def check_goodput_args(args):
@@ -1524,7 +1505,35 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             p.join()
             print(f"Process {i} finished (exit code: {p.exitcode})")
 
-        benchmark_result = merge_subprocess_results(return_dict, args.num_processes)
+        all_outputs = []
+        all_rps_change_events = []
+        durations = []
+        for i in range(args.num_processes):
+            res = return_dict[i]
+            # res is (outputs, rps_change_events, duration)
+            all_outputs.extend(res[0])
+            if res[1]:
+                all_rps_change_events.extend(res[1])
+            durations.append(res[2])
+
+        benchmark_duration = max(durations)
+        task_type = (TaskType.EMBEDDING if api_url.endswith("/v1/embeddings") else
+                     TaskType.GENERATION)
+
+        benchmark_result = process_benchmark_results(
+            outputs=all_outputs,
+            input_requests=input_requests,
+            task_type=task_type,
+            tokenizer=tokenizer,
+            benchmark_duration=benchmark_duration,
+            request_rate=args.request_rate,
+            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
+            selected_percentile_metrics=args.percentile_metrics.split(","),
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=args.max_concurrency,
+            rps_change_events=all_rps_change_events,
+        )
+
         print(f"Multi-process benchmark completed, merged {len(return_dict)} valid process results")
 
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
